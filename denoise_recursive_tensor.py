@@ -1,8 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-Created on Tue Apr  7 19:50:41 2026
+Python Port of denoise_recursive_tensor.m from: 
 
-@author: jr24
+J. L. Olesen, A. Ianus, L. Østergaard, N. Shemesh, and S. N. Jespersen, 
+‘Tensor denoising of multidimensional MRI data’, Magn. Reson. Med., 
+vol. 89, no. 3, 2023, doi: 10.1002/mrm.29478
 """
 
 # denoise_recursive_tensor.py
