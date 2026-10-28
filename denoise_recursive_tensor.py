@@ -4,7 +4,17 @@ Python Port of denoise_recursive_tensor.m from:
 
 J. L. Olesen, A. Ianus, L. Østergaard, N. Shemesh, and S. N. Jespersen, 
 ‘Tensor denoising of multidimensional MRI data’, Magn. Reson. Med., 
-vol. 89, no. 3, 2023, doi: 10.1002/mrm.29478
+vol. 89, no. 3, 2023, doi: 10.1002/mrm.29478.
+
+
+Additions (v9 pipeline), all off by default so the output is unchanged:
+  num_stages   truncate only the first k SVDs of the recursion (in the index-group order);
+               later SVDs keep every component, which is a lossless rotation. None = all.
+  shrink_rule  'frob' (default: optimal shrinkage for Frobenius loss, as in the original) or
+               'operator' (optimal for operator-norm loss: subtracts about half as much from
+               each kept component, so weak, barely detected components are cut much less).
+               Shrinkage is applied to the LAST truncated SVD, as before; opt_shrink=False
+               switches it off.
 """
 
 # denoise_recursive_tensor.py
@@ -12,10 +22,49 @@ vol. 89, no. 3, 2023, doi: 10.1002/mrm.29478
 import numpy as np
 import sys
 
+FEATURES = frozenset({"num_stages", "shrink_rule"})   # checked by Raw2Raw v9 at start-up
+
+
+def _svd(X, method="gram"):
+    """Thin SVD with the same contract as np.linalg.svd(X, full_matrices=False): U, S, Vh.
+
+    method='gram'   eigendecomposition of the smaller Gram matrix (X X^H or X^H X) in double
+                    precision. MP-PCA needs exactly these singular values and vectors; this is
+                    several times faster for the short-and-wide matrices of patch denoising and
+                    gives the same result.
+    method='lapack' np.linalg.svd, as in the original port.
+    """
+    if method == "lapack":
+        return np.linalg.svd(X, full_matrices=False)
+    X = np.asarray(X)
+    Xd = X.astype(np.complex128) if np.iscomplexobj(X) else X.astype(np.float64)
+    M, N = Xd.shape
+    if M <= N:
+        w, U = np.linalg.eigh(Xd @ Xd.conj().T)
+        w, U = w[::-1], U[:, ::-1]
+        S = np.sqrt(np.maximum(w, 0.0))
+        inv = np.where(S > 0, 1.0 / np.where(S > 0, S, 1.0), 0.0)
+        return U, S, (U.conj().T @ Xd) * inv[:, None]
+    w, V = np.linalg.eigh(Xd.conj().T @ Xd)
+    w, V = w[::-1], V[:, ::-1]
+    S = np.sqrt(np.maximum(w, 0.0))
+    inv = np.where(S > 0, 1.0 / np.where(S > 0, S, 1.0), 0.0)
+    return (Xd @ V) * inv[None, :], S, V.conj().T
+
 def opt_shrink_frob(vals2, M, N, sigma2):
     """Equivalent to opt_shrink_frob.m"""
-    # vals2 = vals2 - 2*(N+M)*sigma2 + (N-M)^2*sigma2^2./vals2;
+ # vals2 = vals2 - 2*(N+M)*sigma2 + (N-M)^2*sigma2^2./vals2;
     return vals2 - 2 * (N + M) * sigma2 + (N - M)**2 * sigma2**2 / vals2
+
+def opt_shrink_operator(vals2, M, N, sigma2):
+    """Optimal shrinkage for operator-norm loss (Gavish & Donoho 2017), same units as
+    opt_shrink_frob (squared singular values in, squared singular values out): the estimate of
+    the clean squared singular value, ((l - s2(M+N)) + sqrt((l - s2(M+N))^2 - 4 s2^2 M N)) / 2.
+    For a strong component it subtracts ~sigma2*(M+N), half of what the Frobenius rule
+    subtracts; at the noise edge it keeps ~sigma2*sqrt(M*N) where the Frobenius rule gives 0."""
+    t = vals2 - sigma2 * (M + N)
+    disc = np.maximum(t**2 - 4.0 * sigma2**2 * M * N, 0.0)
+    return np.where(t > 0, 0.5 * (t + np.sqrt(disc)), 0.0)
 
 def subtract_mean(X):
     """Subtracts the mean along the longest dimension."""
@@ -88,16 +137,21 @@ def discard_noise_components(U, S_diag, V, sigma2):
     V_new = V[:, :P]
     return U_new, S_diag_new, V_new, P
 
-def apply_optimal_shrinkage(U, S_diag, V, sigma2):
-    """Applies optimal shrinkage to singular values."""
+def apply_optimal_shrinkage(U, S_diag, V, sigma2, rule="frob"):
+    """Applies optimal shrinkage to singular values ('frob' as in the original, or 'operator')."""
     if len(S_diag) == 0:
         return S_diag
     M = U.shape[0]
     N = V.shape[0]
     P = len(S_diag)
     vals2 = S_diag**2
-    
-    vals2 = opt_shrink_frob(vals2, max(M - P, 1), max(N - P, 1), sigma2)
+
+    if rule == "operator":
+        vals2 = opt_shrink_operator(vals2, max(M - P, 1), max(N - P, 1), sigma2)
+    elif rule == "frob":
+        vals2 = opt_shrink_frob(vals2, max(M - P, 1), max(N - P, 1), sigma2)
+    else:
+        raise ValueError(f"shrink_rule must be 'frob' or 'operator', got {rule!r}")
     # Ensure no negative values before sqrt (equivalent to real(sqrt(vals2)) in MATLAB for edge cases)
     return np.sqrt(np.maximum(vals2, 0.0))
 
@@ -110,9 +164,20 @@ def denoise_array_recursive_tensor(X, **kwargs):
         'subtract_mean': False,
         'num_inds': len(dims),
         'full_sigma2_pass': True,
-        'test': False
+        'test': False,
+        'svd': 'lapack',  # 'gram' is faster; the v6 pipeline passes it explicitly
+        'shrink_rule': 'frob',
+        'num_stages': None
     }
     options.update(kwargs)
+    
+    # SVDs truncated: the first n_trunc index groups (all by default); shrinkage goes on the last
+    num_inds = options['num_inds']
+    if options['num_stages'] is None:
+        n_trunc = num_inds
+    else:
+        n_trunc = max(1, min(int(options['num_stages']), num_inds))
+    last_trunc = n_trunc - 1
     
     use_MPPCA = 'sigma2' not in kwargs
     if not use_MPPCA:
@@ -130,7 +195,7 @@ def denoise_array_recursive_tensor(X, **kwargs):
             X_curr = X
             X_mean = 0.0
             
-        U, S_diag, Vh = np.linalg.svd(X_curr, full_matrices=False)
+        U, S_diag, Vh = _svd(X_curr, options['svd'])
         V = Vh.T
         
         if use_MPPCA:
@@ -139,7 +204,7 @@ def denoise_array_recursive_tensor(X, **kwargs):
         U, S_diag, V, P_val = discard_noise_components(U, S_diag, V, sigma2)
         
         if options['opt_shrink']:
-            S_diag = apply_optimal_shrinkage(U, S_diag, V, sigma2)
+            S_diag = apply_optimal_shrinkage(U, S_diag, V, sigma2, options['shrink_rule'])
             
         X_rec = (U * S_diag) @ V.T + X_mean
         return X_rec, sigma2, [P_val]
@@ -162,7 +227,7 @@ def denoise_array_recursive_tensor(X, **kwargs):
             else:
                 X_mean_list[n] = 0.0
                 
-            U_curr, S_diag_curr, Vh_curr = np.linalg.svd(X_curr, full_matrices=False)
+            U_curr, S_diag_curr, Vh_curr = _svd(X_curr, options['svd'])
             V_curr = Vh_curr.T
             
             _, p_val = estimate_noise(S_diag_curr, dims)
@@ -188,7 +253,7 @@ def denoise_array_recursive_tensor(X, **kwargs):
         else:
             X_mean_list[n] = 0.0
             
-        U_curr, S_diag_curr, Vh_curr = np.linalg.svd(X_curr, full_matrices=False)
+        U_curr, S_diag_curr, Vh_curr = _svd(X_curr, options['svd'])
         U_list[n] = U_curr
         S_list[n] = S_diag_curr
         V_list[n] = Vh_curr.T
@@ -201,6 +266,11 @@ def denoise_array_recursive_tensor(X, **kwargs):
         P_list[n] = p_val
     else:
         P_list = [p_val]
+    # Only when num_stages is set explicitly can the first SVD be the last truncated one
+    # (the default path is untouched, so existing results reproduce bit for bit).
+    if options['opt_shrink'] and options['num_stages'] is not None and last_trunc == 0:
+        S_diag_curr = apply_optimal_shrinkage(U_curr, S_diag_curr, V_curr, sigma2, options['shrink_rule'])
+        S_list[n] = S_diag_curr
         
     X_curr = V_curr * S_diag_curr
     
@@ -218,10 +288,13 @@ def denoise_array_recursive_tensor(X, **kwargs):
         else:
             X_mean_list[n] = 0.0
             
-        U_curr, S_diag_curr, Vh_curr = np.linalg.svd(X_curr, full_matrices=False)
+        U_curr, S_diag_curr, Vh_curr = _svd(X_curr, options['svd'])
         V_curr = Vh_curr.T
         
-        U_curr, S_diag_curr, V_curr, p_val = discard_noise_components(U_curr, S_diag_curr, V_curr, sigma2)
+        if n < n_trunc:
+            U_curr, S_diag_curr, V_curr, p_val = discard_noise_components(U_curr, S_diag_curr, V_curr, sigma2)
+        else:
+            p_val = len(S_diag_curr)   # not truncated: keep every component (lossless rotation)
         
         U_list[n], S_list[n], V_list[n] = U_curr, S_diag_curr, V_curr
         if len(P_list) > n:
@@ -229,8 +302,8 @@ def denoise_array_recursive_tensor(X, **kwargs):
         else:
             P_list.append(p_val)
             
-        if options['opt_shrink'] and n == options['num_inds'] - 1:
-            S_list[n] = apply_optimal_shrinkage(U_list[n], S_list[n], V_list[n], sigma2)
+        if options['opt_shrink'] and n == last_trunc:
+            S_list[n] = apply_optimal_shrinkage(U_list[n], S_list[n], V_list[n], sigma2, options['shrink_rule'])
             
         X_curr = V_list[n] * S_list[n]
         
@@ -276,9 +349,11 @@ def denoise_recursive_tensor(data, window, **kwargs):
         'mask': np.ones(dims_vox, dtype=bool),
         'center_assign': False,
         'stride': [1]*len(window),
-        'test': False
+        'test': False,
+        'progress': True
     }
     options.update(kwargs)
+    show_progress = bool(options['progress'])
     
     indices = options['indices']
     stride = np.array(options['stride'])
@@ -328,9 +403,10 @@ def denoise_recursive_tensor(data, window, **kwargs):
         center_ind = np.ravel_multi_index(center_subs, window, order='F')
         
     # Set up subset of kwargs for the recursive array function (pass anything that isn't specific to this sliding window func)
-    kwargs_denoise = {k: v for k, v in kwargs.items() if k not in ['indices', 'mask', 'center_assign', 'stride']}
+    kwargs_denoise = {k: v for k, v in kwargs.items() if k not in ['indices', 'mask', 'center_assign', 'stride', 'progress']}
 
-    print(f'Denoising progress:   0%', end='', flush=True)
+    if show_progress:
+        print(f'Denoising progress:   0%', end='', flush=True)
 
     for i in range(num_vox):
         index_vector = np.array(np.unravel_index(i, dims_vox, order='F'))
@@ -387,14 +463,19 @@ def denoise_recursive_tensor(data, window, **kwargs):
         p_len = len(p_val)
         if P.shape[1] < p_len:
             P = np.pad(P, ((0, 0), (0, p_len - P.shape[1])), mode='constant')
-        P[vox_indices_curr, :p_len] += p_val
+        # Fix: accumulate ranks on the voxels this patch ASSIGNS to, matching `count`.
+        # (Was vox_indices_curr: with center_assign=True every voxel summed the ranks of
+        #  all ~prod(window) patches covering it but was divided by count = 1, inflating
+        #  P_map and snr_gain. Denoised output and Sigma2 were never affected.)
+        P[vox_indices_assign, :p_len] += p_val
 
         # Progress reporting
-        if i % max(1, round(num_vox/100)) == 0 or i == num_vox - 1:
+        if show_progress and (i % max(1, round(num_vox/100)) == 0 or i == num_vox - 1):
             sys.stdout.write(f'\b\b\b\b{round(100*(i+1)/num_vox):3d}%')
             sys.stdout.flush()
 
-    print() # Newline post-progress
+    if show_progress:
+        print() # Newline post-progress
     
     skipped_vox = (count == 0).flatten()
     denoised[skipped_vox, :] = data_flat[skipped_vox, :]
